@@ -703,6 +703,54 @@ const DEF_GOALS = {
   sugar: 50,
   sodium: 2300
 };
+const REPORT_COLS = [
+  { key: "time", label: "Time", numeric: false },
+  { key: "mealType", label: "Meal", numeric: false },
+  { key: "foodName", label: "Food", numeric: false, forced: true },
+  { key: "servingSize", label: "Serving", numeric: false },
+  { key: "calories", label: "Cal", numeric: true, decimals: 0 },
+  { key: "protein", label: "Pro (g)", numeric: true, decimals: 1 },
+  { key: "carbs", label: "Carb (g)", numeric: true, decimals: 1 },
+  { key: "fat", label: "Fat (g)", numeric: true, decimals: 1 },
+  { key: "fiber", label: "Fbr (g)", numeric: true, decimals: 1 },
+  { key: "sugar", label: "Sgr (g)", numeric: true, decimals: 1 },
+  { key: "sodium", label: "Na (mg)", numeric: true, decimals: 0 }
+];
+const REPORT_DEFAULT_FIELDS = ["time","mealType","servingSize","calories","protein","carbs","fat"];
+const REPORT_MACRO_KEYS = ["calories","protein","carbs","fat","fiber","sugar","sodium"];
+const escapeHtml = s => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+const formatLongDate = ymd => {
+  if (!ymd) return "";
+  const d = new Date(ymd + "T12:00:00");
+  if (isNaN(d)) return ymd;
+  return d.toLocaleDateString("en", { weekday: "long", month: "long", day: "numeric", year: "numeric" });
+};
+const REPORT_PRINT_CSS = `
+  .rpt-doc { background:#fff; color:#1a1a1a; font-family: Georgia, 'Times New Roman', serif; max-width: 820px; margin: 0 auto; padding: 36px 28px; line-height: 1.5; }
+  .rpt-doc h1 { font-size: 26px; margin: 0 0 4px; color: #0f172a; border-bottom: 2px solid #1e3a8a; padding-bottom: 8px; font-family: Georgia, serif; }
+  .rpt-patient { font-size: 17px; color: #334155; margin-top: 8px; font-style: italic; }
+  .rpt-period { font-size: 14px; color: #475569; margin-top: 6px; }
+  .rpt-gen { font-size: 11px; color: #94a3b8; margin-bottom: 22px; }
+  .rpt-summary { background: #f1f5f9; border-left: 4px solid #1e3a8a; padding: 12px 16px; margin: 12px 0 24px; border-radius: 3px; }
+  .rpt-summary-title { font-weight: 700; font-size: 11px; color: #1e3a8a; text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 6px; font-family: Helvetica, Arial, sans-serif; }
+  .rpt-summary-row { font-size: 13px; color: #334155; margin: 2px 0; }
+  .rpt-day { margin-bottom: 26px; page-break-inside: avoid; }
+  .rpt-day h2 { font-size: 16px; color: #1e3a8a; margin: 0 0 3px; border-bottom: 1px solid #cbd5e1; padding-bottom: 3px; font-family: Georgia, serif; }
+  .rpt-day-totals { font-size: 12px; color: #64748b; margin: 3px 0 10px; font-style: italic; }
+  .rpt-table { width: 100%; border-collapse: collapse; font-size: 12px; font-family: 'Helvetica Neue', Arial, sans-serif; }
+  .rpt-table th { background: #f1f5f9; color: #334155; font-weight: 600; text-align: left; padding: 7px 9px; border-bottom: 2px solid #cbd5e1; font-size: 10px; text-transform: uppercase; letter-spacing: 0.3px; }
+  .rpt-table td { padding: 6px 9px; border-bottom: 1px solid #e2e8f0; color: #1a1a1a; vertical-align: top; }
+  .rpt-table tr:last-child td { border-bottom: none; }
+  .rpt-table th.num, .rpt-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .rpt-note-row td { padding: 2px 9px 8px 9px; font-size: 11px; color: #64748b; font-style: italic; border-bottom: 1px solid #e2e8f0; }
+  .rpt-empty { padding: 20px; text-align: center; color: #94a3b8; font-style: italic; }
+  .rpt-footer { margin-top: 30px; padding-top: 12px; border-top: 1px solid #e2e8f0; font-size: 10px; color: #94a3b8; text-align: center; }
+  @media print {
+    body { background: #fff !important; }
+    .rpt-doc { padding: 0; max-width: none; }
+    @page { margin: 1.4cm; }
+  }
+`;
 const TODAY = () => {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
@@ -1758,6 +1806,15 @@ function NutritionTracker() {
   const [aiText, setAiText] = useState("");
   const [aiTextLoading, setAiTextLoading] = useState(false);
   const [aiTextResult, setAiTextResult] = useState(null);
+  const [reportPeriod, setReportPeriod] = useState("7days");
+  const [reportCustomStart, setReportCustomStart] = useState("");
+  const [reportCustomEnd, setReportCustomEnd] = useState("");
+  const [reportFields, setReportFields] = useState(REPORT_DEFAULT_FIELDS);
+  const [reportIncludeNotes, setReportIncludeNotes] = useState(true);
+  const [reportPatientName, setReportPatientName] = useState("");
+  const [reportShowSummary, setReportShowSummary] = useState(true);
+  const [reportShowDailyTotals, setReportShowDailyTotals] = useState(true);
+  const [reportPreview, setReportPreview] = useState(null);
   const fileRef = useRef();
   const isConfigured = !!(config.apiKey && config.baseId && config.tableName);
   const showToast = (msg, type = "success") => {
@@ -1773,6 +1830,240 @@ function NutritionTracker() {
   useEffect(() => {
     lsSet("nt_meals", savedMeals);
   }, [savedMeals]);
+  const computeReportRange = () => {
+    const today = TODAY();
+    const d = new Date(today + "T12:00:00");
+    const fmt = dt => `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,"0")}-${String(dt.getDate()).padStart(2,"0")}`;
+    if (reportPeriod === "7days") {
+      const s = new Date(d); s.setDate(s.getDate() - 6);
+      return { start: fmt(s), end: today };
+    }
+    if (reportPeriod === "30days") {
+      const s = new Date(d); s.setDate(s.getDate() - 29);
+      return { start: fmt(s), end: today };
+    }
+    if (reportPeriod === "thismonth") {
+      return { start: `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-01`, end: today };
+    }
+    return { start: reportCustomStart || "", end: reportCustomEnd || "" };
+  };
+  const reportFieldValue = (entry, key) => {
+    switch (key) {
+      case "time": return entry.time || entry["Time"] || "";
+      case "mealType": return entry.mealType || entry["Meal Type"] || "";
+      case "foodName": return entry.foodName || entry["Food Name"] || "";
+      case "servingSize": return entry.servingSize || entry["Serving Size"] || "";
+      case "calories": return +(entry.calories || entry["Calories"] || 0);
+      case "protein": return +(entry.protein || entry["Protein (g)"] || 0);
+      case "carbs": return +(entry.carbs || entry["Carbs (g)"] || 0);
+      case "fat": return +(entry.fat || entry["Fat (g)"] || 0);
+      case "fiber": return +(entry.fiber || entry["Fiber (g)"] || 0);
+      case "sugar": return +(entry.sugar || entry["Sugar (g)"] || 0);
+      case "sodium": return +(entry.sodium || entry["Sodium (mg)"] || 0);
+      case "notes": return entry.notes || entry["Notes"] || "";
+      default: return "";
+    }
+  };
+  const formatReportNum = (v, decimals) => {
+    if (!isFinite(v)) return "0";
+    const m = Math.pow(10, decimals);
+    const rounded = Math.round(v * m) / m;
+    return decimals === 0 ? String(Math.round(rounded)) : String(rounded);
+  };
+  const formatMacroForSummary = (k, value) => {
+    const col = REPORT_COLS.find(c => c.key === k);
+    const num = formatReportNum(value, col.decimals);
+    if (k === "calories") return `${num} cal`;
+    if (k === "sodium") return `${num} mg sodium`;
+    const labelMap = { protein: "protein", carbs: "carbs", fat: "fat", fiber: "fiber", sugar: "sugar" };
+    return `${num}g ${labelMap[k] || k}`;
+  };
+  const buildReportHtml = () => {
+    const { start, end } = computeReportRange();
+    if (!start || !end) return { html: null, error: "Pick a valid date range first" };
+    if (start > end) return { html: null, error: "Start date must be on or before end date" };
+    const filtered = entries.filter(e => {
+      const dt = e.date || e["Date"];
+      return dt && dt >= start && dt <= end;
+    }).sort((a, b) => {
+      const da = a.date || a["Date"] || "";
+      const db = b.date || b["Date"] || "";
+      if (da !== db) return da < db ? -1 : 1;
+      const ta = a.time || a["Time"] || "";
+      const tb = b.time || b["Time"] || "";
+      return ta < tb ? -1 : ta > tb ? 1 : 0;
+    });
+    // Always include foodName, plus user-selected fields, in canonical order
+    const activeKeys = new Set([...reportFields, "foodName"]);
+    const cols = REPORT_COLS.filter(c => activeKeys.has(c.key));
+    // Group by day
+    const byDay = [];
+    let curDate = null, cur = null;
+    for (const e of filtered) {
+      const d = e.date || e["Date"];
+      if (d !== curDate) {
+        cur = { date: d, entries: [] };
+        byDay.push(cur);
+        curDate = d;
+      }
+      cur.entries.push(e);
+    }
+    let html = `<div class="rpt-doc"><style>${REPORT_PRINT_CSS}</style>`;
+    html += `<h1>Nutrition Log</h1>`;
+    if (reportPatientName.trim()) html += `<div class="rpt-patient">${escapeHtml(reportPatientName.trim())}</div>`;
+    html += `<div class="rpt-period">Period: ${escapeHtml(formatLongDate(start))} – ${escapeHtml(formatLongDate(end))}</div>`;
+    html += `<div class="rpt-gen">Generated ${escapeHtml(new Date().toLocaleString("en"))}</div>`;
+    if (!filtered.length) {
+      html += `<div class="rpt-empty">No entries logged in this period.</div></div>`;
+      return { html, range: { start, end }, count: 0 };
+    }
+    if (reportShowSummary) {
+      const dayCount = byDay.length;
+      const tot = {};
+      REPORT_MACRO_KEYS.forEach(k => { tot[k] = filtered.reduce((a,e) => a + reportFieldValue(e,k), 0); });
+      const macrosToShow = REPORT_MACRO_KEYS.filter(k => reportFields.includes(k));
+      html += `<div class="rpt-summary">`;
+      html += `<div class="rpt-summary-title">Period Summary</div>`;
+      html += `<div class="rpt-summary-row">${filtered.length} ${filtered.length === 1 ? "entry" : "entries"} across ${dayCount} ${dayCount === 1 ? "day" : "days"}</div>`;
+      if (macrosToShow.length) {
+        html += `<div class="rpt-summary-row"><strong>Daily average:</strong> ${macrosToShow.map(k => formatMacroForSummary(k, tot[k]/dayCount)).join(" · ")}</div>`;
+        html += `<div class="rpt-summary-row"><strong>Period total:</strong> ${macrosToShow.map(k => formatMacroForSummary(k, tot[k])).join(" · ")}</div>`;
+      }
+      html += `</div>`;
+    }
+    for (const day of byDay) {
+      html += `<div class="rpt-day">`;
+      html += `<h2>${escapeHtml(formatLongDate(day.date))}</h2>`;
+      if (reportShowDailyTotals) {
+        const macrosToShow = REPORT_MACRO_KEYS.filter(k => reportFields.includes(k));
+        if (macrosToShow.length) {
+          const parts = macrosToShow.map(k => formatMacroForSummary(k, day.entries.reduce((a,e) => a + reportFieldValue(e,k), 0)));
+          html += `<div class="rpt-day-totals">Daily total: ${parts.join(" · ")}</div>`;
+        }
+      }
+      html += `<table class="rpt-table"><thead><tr>`;
+      cols.forEach(c => { html += `<th${c.numeric ? ' class="num"' : ""}>${escapeHtml(c.label)}</th>`; });
+      html += `</tr></thead><tbody>`;
+      for (const e of day.entries) {
+        html += `<tr>`;
+        cols.forEach(c => {
+          const raw = reportFieldValue(e, c.key);
+          const cell = c.numeric ? formatReportNum(raw, c.decimals) : escapeHtml(raw);
+          html += `<td${c.numeric ? ' class="num"' : ""}>${cell}</td>`;
+        });
+        html += `</tr>`;
+        if (reportIncludeNotes) {
+          const note = reportFieldValue(e, "notes");
+          if (note) html += `<tr class="rpt-note-row"><td colspan="${cols.length}">${escapeHtml(note)}</td></tr>`;
+        }
+      }
+      html += `</tbody></table></div>`;
+    }
+    html += `<div class="rpt-footer">Generated by NutriLog · ${escapeHtml(new Date().toLocaleDateString("en"))}</div>`;
+    html += `</div>`;
+    return { html, range: { start, end }, count: filtered.length };
+  };
+  const generateReport = () => {
+    const r = buildReportHtml();
+    if (!r.html) { showToast(r.error || "Could not build report", "error"); return; }
+    setReportPreview(r);
+    showToast(r.count > 0 ? `Report ready · ${r.count} ${r.count === 1 ? "entry" : "entries"}` : "Report generated (no entries)");
+  };
+  const printReport = () => {
+    if (!reportPreview) { showToast("Generate the report first", "error"); return; }
+    const w = window.open("", "_blank", "width=900,height=720");
+    if (!w) { showToast("Pop-up blocked — allow pop-ups for this site", "error"); return; }
+    w.document.write(`<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>Nutrition Report ${reportPreview.range.start} to ${reportPreview.range.end}</title></head><body>${reportPreview.html}</body></html>`);
+    w.document.close();
+    setTimeout(() => { try { w.focus(); w.print(); } catch (e) {} }, 350);
+  };
+  const downloadReportHtml = () => {
+    if (!reportPreview) { showToast("Generate the report first", "error"); return; }
+    const { start, end } = reportPreview.range;
+    const html = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>Nutrition Report ${start} to ${end}</title></head><body>${reportPreview.html}</body></html>`;
+    const blob = new Blob([html], { type: "text/html;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `nutrition-report-${start}-to-${end}.html`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+    showToast("Report downloaded ✓");
+  };
+  const copyReportAsText = async () => {
+    if (!reportPreview) { showToast("Generate the report first", "error"); return; }
+    const { start, end } = reportPreview.range;
+    const filtered = entries.filter(e => {
+      const dt = e.date || e["Date"];
+      return dt && dt >= start && dt <= end;
+    }).sort((a, b) => {
+      const da = a.date || a["Date"] || "";
+      const db = b.date || b["Date"] || "";
+      if (da !== db) return da < db ? -1 : 1;
+      return (a.time || a["Time"] || "") < (b.time || b["Time"] || "") ? -1 : 1;
+    });
+    const lines = ["NUTRITION LOG"];
+    if (reportPatientName.trim()) lines.push(reportPatientName.trim());
+    lines.push(`Period: ${formatLongDate(start)} – ${formatLongDate(end)}`);
+    lines.push(`Generated: ${new Date().toLocaleString("en")}`);
+    lines.push("");
+    if (!filtered.length) {
+      lines.push("(No entries logged in this period.)");
+    } else {
+      // group by day
+      const days = {};
+      filtered.forEach(e => {
+        const d = e.date || e["Date"];
+        if (!days[d]) days[d] = [];
+        days[d].push(e);
+      });
+      const macros = REPORT_MACRO_KEYS.filter(k => reportFields.includes(k));
+      for (const d of Object.keys(days).sort()) {
+        lines.push("─".repeat(40));
+        lines.push(formatLongDate(d).toUpperCase());
+        if (reportShowDailyTotals && macros.length) {
+          lines.push(`Daily total: ${macros.map(k => formatMacroForSummary(k, days[d].reduce((a,e) => a + reportFieldValue(e,k), 0))).join(" · ")}`);
+        }
+        for (const e of days[d]) {
+          const t = reportFieldValue(e, "time");
+          const m = reportFieldValue(e, "mealType");
+          const f = reportFieldValue(e, "foodName");
+          const s = reportFieldValue(e, "servingSize");
+          const parts = [];
+          if (reportFields.includes("time") && t) parts.push(t);
+          if (reportFields.includes("mealType") && m) parts.push(`[${m}]`);
+          parts.push(f || "(unnamed)");
+          if (reportFields.includes("servingSize") && s) parts.push(`(${s})`);
+          const macroBits = macros.map(k => formatMacroForSummary(k, reportFieldValue(e, k)));
+          if (macroBits.length) parts.push("— " + macroBits.join(", "));
+          lines.push("  " + parts.join(" "));
+          if (reportIncludeNotes) {
+            const note = reportFieldValue(e, "notes");
+            if (note) lines.push(`     Note: ${note}`);
+          }
+        }
+        lines.push("");
+      }
+    }
+    const text = lines.join("\n");
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast("Report copied to clipboard ✓");
+    } catch (err) {
+      // Fallback: temporary textarea
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy"); showToast("Report copied to clipboard ✓"); }
+      catch (e2) { showToast("Could not copy — try Download instead", "error"); }
+      document.body.removeChild(ta);
+    }
+  };
   const loadEntries = useCallback(async () => {
     // Always load local entries first
     const local = ls("nt_local", []);
@@ -2145,7 +2436,7 @@ function NutritionTracker() {
       value
     }));
   })();
-  const NAV = [["quick", "⚡ Log"], ["library", "🗂 Foods"], ["meals", "🍽 Meals"], ["dashboard", "📊 Data"], ["settings", "⚙️"]];
+  const NAV = [["quick", "⚡ Log"], ["library", "🗂 Foods"], ["meals", "🍽 Meals"], ["dashboard", "📊 Data"], ["report", "📄 Report"], ["settings", "⚙️"]];
   return /*#__PURE__*/React.createElement("div", {
     style: {
       minHeight: "100vh",
@@ -4510,7 +4801,211 @@ function NutritionTracker() {
     style: {
       display: "none"
     }
-  })))))), showFoodPicker && /*#__PURE__*/React.createElement(FoodPicker, {
+  })))))), view === "report" && /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 16
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: { ...S.card }
+  }, /*#__PURE__*/React.createElement("h2", {
+    style: { margin: "0 0 4px", fontSize: 22, color: "#f8fafc" }
+  }, "\uD83D\uDCC4 Nutritionist Report"), /*#__PURE__*/React.createElement("p", {
+    style: { color: "#475569", margin: "0 0 16px", fontSize: 14 }
+  }, "Pick a period and fields, then print, save as PDF, or copy/download to email."),
+  // Patient name
+  /*#__PURE__*/React.createElement("label", { style: S.label }, "Patient name (optional)"),
+  /*#__PURE__*/React.createElement("input", {
+    type: "text",
+    value: reportPatientName,
+    onChange: e => setReportPatientName(e.target.value),
+    placeholder: "Leave blank to omit",
+    style: { ...S.input, marginBottom: 16 }
+  }),
+  // Period
+  /*#__PURE__*/React.createElement("label", { style: S.label }, "Period"),
+  /*#__PURE__*/React.createElement("div", {
+    style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 10 }
+  }, [["7days","Last 7 days"],["30days","Last 30 days"],["thismonth","This month"],["custom","Custom range"]].map(([val, label]) =>
+    /*#__PURE__*/React.createElement("button", {
+      key: val,
+      onClick: () => setReportPeriod(val),
+      style: {
+        background: reportPeriod === val ? "#1e3a8a" : "#0f172a",
+        border: `1px solid ${reportPeriod === val ? "#3b82f6" : "#1e293b"}`,
+        color: reportPeriod === val ? "#dbeafe" : "#94a3b8",
+        borderRadius: 8,
+        padding: "10px",
+        fontWeight: 600,
+        fontSize: 13,
+        cursor: "pointer",
+        fontFamily: "inherit"
+      }
+    }, label)
+  )),
+  reportPeriod === "custom" && /*#__PURE__*/React.createElement("div", {
+    style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 16 }
+  }, /*#__PURE__*/React.createElement("div", null,
+    /*#__PURE__*/React.createElement("label", { style: { ...S.label, fontSize: 11 } }, "Start"),
+    /*#__PURE__*/React.createElement("input", {
+      type: "date",
+      value: reportCustomStart,
+      onChange: e => setReportCustomStart(e.target.value),
+      style: S.input
+    })
+  ), /*#__PURE__*/React.createElement("div", null,
+    /*#__PURE__*/React.createElement("label", { style: { ...S.label, fontSize: 11 } }, "End"),
+    /*#__PURE__*/React.createElement("input", {
+      type: "date",
+      value: reportCustomEnd,
+      onChange: e => setReportCustomEnd(e.target.value),
+      style: S.input
+    })
+  )),
+  /*#__PURE__*/React.createElement("div", { style: { height: 6 } }),
+  // Fields
+  /*#__PURE__*/React.createElement("label", { style: S.label }, "Fields (Food Name is always included)"),
+  /*#__PURE__*/React.createElement("div", {
+    style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 12 }
+  }, REPORT_COLS.filter(c => !c.forced).map(c => {
+    const selected = reportFields.includes(c.key);
+    return /*#__PURE__*/React.createElement("button", {
+      key: c.key,
+      onClick: () => setReportFields(fs => selected ? fs.filter(k => k !== c.key) : [...fs, c.key]),
+      style: {
+        background: selected ? "#052e16" : "#0f172a",
+        border: `1px solid ${selected ? "#22c55e" : "#1e293b"}`,
+        color: selected ? "#86efac" : "#64748b",
+        borderRadius: 6,
+        padding: "8px 10px",
+        fontSize: 12,
+        fontWeight: 600,
+        cursor: "pointer",
+        textAlign: "left",
+        fontFamily: "inherit"
+      }
+    }, (selected ? "✓ " : "  ") + c.label);
+  })),
+  // Notes toggle
+  /*#__PURE__*/React.createElement("button", {
+    onClick: () => setReportIncludeNotes(v => !v),
+    style: {
+      background: reportIncludeNotes ? "#052e16" : "#0f172a",
+      border: `1px solid ${reportIncludeNotes ? "#22c55e" : "#1e293b"}`,
+      color: reportIncludeNotes ? "#86efac" : "#64748b",
+      borderRadius: 6,
+      padding: "8px 10px",
+      fontSize: 12,
+      fontWeight: 600,
+      cursor: "pointer",
+      textAlign: "left",
+      fontFamily: "inherit",
+      marginBottom: 16
+    }
+  }, (reportIncludeNotes ? "✓ " : "  ") + "Include per-meal notes (shown below each row)"),
+  // Options
+  /*#__PURE__*/React.createElement("label", { style: S.label }, "Sections"),
+  /*#__PURE__*/React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 6, marginBottom: 18 } },
+    /*#__PURE__*/React.createElement("button", {
+      onClick: () => setReportShowSummary(v => !v),
+      style: {
+        background: reportShowSummary ? "#052e16" : "#0f172a",
+        border: `1px solid ${reportShowSummary ? "#22c55e" : "#1e293b"}`,
+        color: reportShowSummary ? "#86efac" : "#64748b",
+        borderRadius: 6,
+        padding: "8px 10px",
+        fontSize: 12,
+        fontWeight: 600,
+        cursor: "pointer",
+        textAlign: "left",
+        fontFamily: "inherit"
+      }
+    }, (reportShowSummary ? "✓ " : "  ") + "Period summary (entry count, averages, totals)"),
+    /*#__PURE__*/React.createElement("button", {
+      onClick: () => setReportShowDailyTotals(v => !v),
+      style: {
+        background: reportShowDailyTotals ? "#052e16" : "#0f172a",
+        border: `1px solid ${reportShowDailyTotals ? "#22c55e" : "#1e293b"}`,
+        color: reportShowDailyTotals ? "#86efac" : "#64748b",
+        borderRadius: 6,
+        padding: "8px 10px",
+        fontSize: 12,
+        fontWeight: 600,
+        cursor: "pointer",
+        textAlign: "left",
+        fontFamily: "inherit"
+      }
+    }, (reportShowDailyTotals ? "✓ " : "  ") + "Daily totals (one line per day)")
+  ),
+  // Generate
+  /*#__PURE__*/React.createElement("button", {
+    onClick: generateReport,
+    style: {
+      width: "100%",
+      background: "linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%)",
+      border: "none",
+      color: "white",
+      borderRadius: 10,
+      padding: "14px",
+      fontWeight: 700,
+      fontSize: 15,
+      cursor: "pointer",
+      fontFamily: "inherit"
+    }
+  }, reportPreview ? "🔄 Regenerate Preview" : "📄 Generate Preview")),
+  // Preview + actions
+  reportPreview && /*#__PURE__*/React.createElement("div", {
+    style: { ...S.card, padding: 0, overflow: "hidden" }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: { padding: 14, borderBottom: "1px solid #1e293b", background: "#0f172a", display: "flex", flexWrap: "wrap", gap: 8 }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: printReport,
+    style: {
+      flex: "1 1 130px",
+      background: "#1e293b",
+      border: "1px solid #334155",
+      color: "#e2e8f0",
+      borderRadius: 8,
+      padding: "10px 12px",
+      fontWeight: 700,
+      fontSize: 13,
+      cursor: "pointer",
+      fontFamily: "inherit"
+    }
+  }, "🖨️ Print / Save as PDF"), /*#__PURE__*/React.createElement("button", {
+    onClick: downloadReportHtml,
+    style: {
+      flex: "1 1 130px",
+      background: "#1e293b",
+      border: "1px solid #334155",
+      color: "#e2e8f0",
+      borderRadius: 8,
+      padding: "10px 12px",
+      fontWeight: 700,
+      fontSize: 13,
+      cursor: "pointer",
+      fontFamily: "inherit"
+    }
+  }, "💾 Download HTML"), /*#__PURE__*/React.createElement("button", {
+    onClick: copyReportAsText,
+    style: {
+      flex: "1 1 130px",
+      background: "#1e293b",
+      border: "1px solid #334155",
+      color: "#e2e8f0",
+      borderRadius: 8,
+      padding: "10px 12px",
+      fontWeight: 700,
+      fontSize: 13,
+      cursor: "pointer",
+      fontFamily: "inherit"
+    }
+  }, "📋 Copy as text")),
+  /*#__PURE__*/React.createElement("div", {
+    style: { padding: 0, background: "#fff", maxHeight: "70vh", overflow: "auto" },
+    dangerouslySetInnerHTML: { __html: reportPreview.html }
+  }))), showFoodPicker && /*#__PURE__*/React.createElement(FoodPicker, {
     foods: myFoods,
     onClose: () => setShowFoodPicker(false),
     onSelect: food => {
