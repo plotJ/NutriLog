@@ -333,7 +333,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
 <script>
 const { useState, useEffect, useRef, useCallback } = React;
 const { AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
-        XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } = Recharts;
+        XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, ReferenceLine } = Recharts;
 
 const airtableFetch = async (cfg, path, method = "GET", body = null) => {
   const url = `https://api.airtable.com/v0/${cfg.baseId}/${encodeURIComponent(cfg.tableName)}${path}`;
@@ -549,6 +549,271 @@ const pushToAirtable = async (cfg, entries) => {
   }
   return pushed;
 };
+
+// ── Foods/Meals Airtable sync ────────────────────────────────────────────────
+// Parameterized version of airtableFetch so we can target multiple tables
+// from the same base (Foods, Meals) while reusing the same auth + error handling.
+const airtableFetchT = async (cfg, tableName, path, method = "GET", body = null) => {
+  const url = `https://api.airtable.com/v0/${cfg.baseId}/${encodeURIComponent(tableName)}${path}`;
+  const opts = {
+    method,
+    headers: {
+      Authorization: `Bearer ${cfg.apiKey}`,
+      "Content-Type": "application/json"
+    }
+  };
+  if (body) opts.body = JSON.stringify(body);
+  const res = await fetch(url, opts);
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`Airtable (${tableName}): ${res.status} ${txt.slice(0, 160)}`);
+  }
+  // DELETE returns a small body; some endpoints return 200 no-content. Be lenient.
+  const ct = res.headers.get("content-type") || "";
+  return ct.includes("application/json") ? res.json() : {};
+};
+
+const FOODS_FIELDS = [
+  { name: "Local ID", type: "singleLineText" },
+  { name: "Name", type: "singleLineText" },
+  { name: "Unit", type: "singleLineText" },
+  { name: "Base Qty", type: "number", options: { precision: 2 } },
+  { name: "Calories", type: "number", options: { precision: 1 } },
+  { name: "Protein (g)", type: "number", options: { precision: 1 } },
+  { name: "Carbs (g)", type: "number", options: { precision: 1 } },
+  { name: "Fat (g)", type: "number", options: { precision: 1 } },
+  { name: "Fiber (g)", type: "number", options: { precision: 1 } },
+  { name: "Sugar (g)", type: "number", options: { precision: 1 } },
+  { name: "Sodium (mg)", type: "number", options: { precision: 0 } }
+];
+
+const MEALS_FIELDS = [
+  { name: "Local ID", type: "singleLineText" },
+  { name: "Name", type: "singleLineText" },
+  { name: "Meal Type", type: "singleLineText" },
+  { name: "Ingredients", type: "multilineText" },
+  { name: "Add-Ins", type: "multilineText" }
+];
+
+// Make sure the named table exists in the base. If missing, create it with the
+// given schema. If it exists but lacks "Local ID", add it. Requires schema.bases:write.
+const ensureTableExists = async (cfg, tableName, fields) => {
+  const schemaRes = await fetch(`https://api.airtable.com/v0/meta/bases/${cfg.baseId}/tables`, {
+    headers: { Authorization: `Bearer ${cfg.apiKey}` }
+  });
+  if (!schemaRes.ok) return; // surface real error on next call
+  const schema = await schemaRes.json();
+  const table = (schema.tables || []).find(t => t.name === tableName);
+  if (!table) {
+    const createRes = await fetch(`https://api.airtable.com/v0/meta/bases/${cfg.baseId}/tables`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${cfg.apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ name: tableName, fields })
+    });
+    if (!createRes.ok) {
+      const t = await createRes.text();
+      throw new Error(`Airtable: couldn't create ${tableName}: ${createRes.status} ${t.slice(0, 160)}`);
+    }
+    return;
+  }
+  // Table exists; ensure Local ID at least (other fields will get typecast on push)
+  const hasLocalId = (table.fields || []).some(f => f.name === "Local ID");
+  if (!hasLocalId) {
+    const createRes = await fetch(`https://api.airtable.com/v0/meta/bases/${cfg.baseId}/tables/${table.id}/fields`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${cfg.apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ name: "Local ID", type: "singleLineText" })
+    });
+    if (!createRes.ok) {
+      const t = await createRes.text();
+      throw new Error(`Couldn't add "Local ID" to ${tableName}: ${createRes.status} ${t.slice(0, 160)}`);
+    }
+  }
+};
+
+const foodsTableNameOf = cfg => cfg.foodsTableName || "Foods";
+const mealsTableNameOf = cfg => cfg.mealsTableName || "Meals";
+
+// Push foods. Upsert by Local ID so editing a row updates instead of duplicating.
+const pushFoodsToAirtable = async (cfg, foods) => {
+  if (!foods || !foods.length) return 0;
+  const tableName = foodsTableNameOf(cfg);
+  await ensureTableExists(cfg, tableName, FOODS_FIELDS);
+  // Build fields safely: omit empty strings (some Airtable field types reject ""
+  // even with typecast — e.g. if a previous attempt auto-created "Unit" as a
+  // numeric or single-select field, sending "" or "serving" will 422).
+  // Numeric fields always send a number; text fields are only sent when non-empty.
+  const buildFields = f => {
+    const out = {
+      "Local ID": String(f.id || ""),
+      "Base Qty": +(f.baseQty) || 0,
+      "Calories": +(f.calories) || 0,
+      "Protein (g)": +(f.protein) || 0,
+      "Carbs (g)": +(f.carbs) || 0,
+      "Fat (g)": +(f.fat) || 0,
+      "Fiber (g)": +(f.fiber) || 0,
+      "Sugar (g)": +(f.sugar) || 0,
+      "Sodium (mg)": +(f.sodium) || 0
+    };
+    if (f.name && String(f.name).trim()) out["Name"] = String(f.name);
+    if (f.unit && String(f.unit).trim()) out["Unit"] = String(f.unit);
+    return out;
+  };
+  const chunks = [];
+  for (let i = 0; i < foods.length; i += 10) chunks.push(foods.slice(i, i + 10));
+  let pushed = 0;
+  for (const chunk of chunks) {
+    try {
+      await airtableFetchT(cfg, tableName, "", "PATCH", {
+        performUpsert: { fieldsToMergeOn: ["Local ID"] },
+        records: chunk.map(f => ({ fields: buildFields(f) })),
+        typecast: true
+      });
+    } catch (e) {
+      // Surface a friendlier hint when an existing table has the wrong field type.
+      if (/INVALID_VALUE_FOR_COLUMN/.test(e.message)) {
+        throw new Error(`${e.message} — your existing "${tableName}" table in Airtable has a column type that doesn't match. Easiest fix: rename or delete the "${tableName}" table in Airtable so NutriLog can create a fresh one (or change "Foods Table" in Settings to a new name).`);
+      }
+      throw e;
+    }
+    pushed += chunk.length;
+  }
+  return pushed;
+};
+
+// Pull foods. Prefer Local ID over Airtable record id so cross-device stays stable.
+const pullFoodsFromAirtable = async cfg => {
+  const tableName = foodsTableNameOf(cfg);
+  const data = await airtableFetchT(cfg, tableName, "?maxRecords=1000");
+  return (data.records || []).map(r => {
+    const fields = r.fields || {};
+    const localId = fields["Local ID"];
+    return {
+      id: (localId && String(localId).trim()) || r.id,
+      _airtableRecId: r.id,
+      name: fields["Name"] || "",
+      unit: fields["Unit"] || "",
+      baseQty: +(fields["Base Qty"]) || 1,
+      calories: +(fields["Calories"]) || 0,
+      protein: +(fields["Protein (g)"]) || 0,
+      carbs: +(fields["Carbs (g)"]) || 0,
+      fat: +(fields["Fat (g)"]) || 0,
+      fiber: +(fields["Fiber (g)"]) || 0,
+      sugar: +(fields["Sugar (g)"]) || 0,
+      sodium: +(fields["Sodium (mg)"]) || 0
+    };
+  });
+};
+
+// Push meals. Ingredients are stored as JSON in a long-text field so we don't
+// need a linked-records setup. Upsert by Local ID.
+const pushMealsToAirtable = async (cfg, meals) => {
+  if (!meals || !meals.length) return 0;
+  const tableName = mealsTableNameOf(cfg);
+  await ensureTableExists(cfg, tableName, MEALS_FIELDS);
+  const chunks = [];
+  for (let i = 0; i < meals.length; i += 10) chunks.push(meals.slice(i, i + 10));
+  let pushed = 0;
+  for (const chunk of chunks) {
+    await airtableFetchT(cfg, tableName, "", "PATCH", {
+      performUpsert: { fieldsToMergeOn: ["Local ID"] },
+      records: chunk.map(m => ({
+        fields: {
+          "Local ID": String(m.id || ""),
+          "Name": m.name || "",
+          "Meal Type": m.mealType || "",
+          "Ingredients": JSON.stringify(m.ingredients || []),
+          "Add-Ins": JSON.stringify(m.addIns || [])
+        }
+      })),
+      typecast: true
+    });
+    pushed += chunk.length;
+  }
+  return pushed;
+};
+
+const pullMealsFromAirtable = async cfg => {
+  const tableName = mealsTableNameOf(cfg);
+  const data = await airtableFetchT(cfg, tableName, "?maxRecords=1000");
+  return (data.records || []).map(r => {
+    const fields = r.fields || {};
+    const localId = fields["Local ID"];
+    let ingredients = [];
+    let addIns = [];
+    try { ingredients = JSON.parse(fields["Ingredients"] || "[]") || []; } catch (e) {}
+    try { addIns = JSON.parse(fields["Add-Ins"] || "[]") || []; } catch (e) {}
+    return {
+      id: (localId && String(localId).trim()) || r.id,
+      _airtableRecId: r.id,
+      name: fields["Name"] || "",
+      mealType: fields["Meal Type"] || "",
+      ingredients,
+      addIns
+    };
+  });
+};
+
+// Look up a record by Local ID and delete it. Used so a local delete also
+// removes the remote row (Airtable's upsert API has no delete mode).
+const deleteFromAirtableByLocalId = async (cfg, tableName, localId) => {
+  if (!localId) return false;
+  const safe = String(localId).replace(/'/g, "\\'");
+  const formula = encodeURIComponent(`{Local ID}='${safe}'`);
+  const data = await airtableFetchT(cfg, tableName, `?filterByFormula=${formula}&maxRecords=10`);
+  const recs = data.records || [];
+  if (!recs.length) return false;
+  for (const r of recs) {
+    await airtableFetchT(cfg, tableName, `/${r.id}`, "DELETE");
+  }
+  return true;
+};
+
+// Scan a table for rows sharing a Local ID and delete the duplicates.
+// Keeps the first record per Local ID, deletes the rest. Returns count deleted.
+// Used to clean up legacy duplicates from before the upsert-by-Local-ID fix.
+const cleanupAirtableDuplicates = async (cfg, tableName) => {
+  let offset, allRecords = [];
+  do {
+    const path = offset ? `?maxRecords=100&offset=${offset}` : "?maxRecords=100";
+    const data = await airtableFetchT(cfg, tableName, path);
+    allRecords = allRecords.concat(data.records || []);
+    offset = data.offset;
+  } while (offset);
+  // Group by Local ID (skip records without one — those can't be deduped reliably)
+  const byLocalId = new Map();
+  for (const r of allRecords) {
+    const lid = (r.fields || {})["Local ID"];
+    if (!lid) continue;
+    const key = String(lid).trim();
+    if (!key) continue;
+    if (!byLocalId.has(key)) byLocalId.set(key, []);
+    byLocalId.get(key).push(r);
+  }
+  // For each group with >1, delete all but the first
+  const toDelete = [];
+  for (const [, group] of byLocalId) {
+    if (group.length > 1) {
+      for (let i = 1; i < group.length; i++) toDelete.push(group[i].id);
+    }
+  }
+  // Delete in batches of 10 (Airtable limit for DELETE multiple)
+  let deleted = 0;
+  for (let i = 0; i < toDelete.length; i += 10) {
+    const batch = toDelete.slice(i, i + 10);
+    const qs = batch.map(id => `records[]=${encodeURIComponent(id)}`).join("&");
+    await airtableFetchT(cfg, tableName, `?${qs}`, "DELETE");
+    deleted += batch.length;
+  }
+  return { deleted, scanned: allRecords.length, groupsWithDupes: Array.from(byLocalId.values()).filter(g => g.length > 1).length };
+};
+
 const callAnthropic = async (anthropicKey, body) => {
   if (!anthropicKey) {
     throw new Error("No Anthropic API key set. Add one in Settings → AI Configuration.");
@@ -1815,6 +2080,7 @@ function NutritionTracker() {
   const [reportShowSummary, setReportShowSummary] = useState(true);
   const [reportShowDailyTotals, setReportShowDailyTotals] = useState(true);
   const [reportPreview, setReportPreview] = useState(null);
+  const [libraryTab, setLibraryTab] = useState("foods");
   const fileRef = useRef();
   const isConfigured = !!(config.apiKey && config.baseId && config.tableName);
   const showToast = (msg, type = "success") => {
@@ -2073,10 +2339,19 @@ function NutritionTracker() {
     setLoading(true);
     try {
       const remote = await fetchFromAirtable(config, analyticsRange + 2);
-      // merge: remote records + any local-only records not yet synced
-      const remoteIds = new Set(remote.map(r => r.id));
-      const localOnly = local.filter(e => !remoteIds.has(e.id));
-      const merged = [...remote, ...localOnly];
+      // Dedupe remote by id. If Airtable has multiple rows for the same Local ID
+      // (legacy data from before the upsert fix), keep only the first occurrence —
+      // fetchFromAirtable already sorts by Date desc, so this is the newest one.
+      const seen = new Set();
+      const dedupedRemote = [];
+      for (const r of remote) {
+        if (seen.has(r.id)) continue;
+        seen.add(r.id);
+        dedupedRemote.push(r);
+      }
+      // merge: deduped remote records + any local-only records not yet synced
+      const localOnly = local.filter(e => !seen.has(e.id));
+      const merged = [...dedupedRemote, ...localOnly];
       // Persist the merged set so localStorage and Airtable agree on ids going forward
       lsSet("nt_local", merged);
       setEntries(merged);
@@ -2436,7 +2711,7 @@ function NutritionTracker() {
       value
     }));
   })();
-  const NAV = [["quick", "⚡ Log"], ["library", "🗂 Foods"], ["meals", "🍽 Meals"], ["dashboard", "📊 Data"], ["report", "📄 Report"], ["settings", "⚙️"]];
+  const NAV = [["quick", "⚡ Log"], ["library", "🗂 Library"], ["dashboard", "📊 Data"], ["report", "📄 Report"], ["settings", "⚙️"]];
   return /*#__PURE__*/React.createElement("div", {
     style: {
       minHeight: "100vh",
@@ -2787,7 +3062,8 @@ function NutritionTracker() {
           ...i
         }))
       });
-      setView("meals");
+      setView("library");
+      setLibraryTab("meals");
     }
   })))), /*#__PURE__*/React.createElement("button", {
     onClick: startBlank,
@@ -3210,7 +3486,40 @@ function NutritionTracker() {
       borderRadius: 12,
       opacity: activeMeal.ingredients.length === 0 ? 0.4 : 1
     }
-  }, "\u2713 Log This Meal")))), view === "library" && /*#__PURE__*/React.createElement("div", {
+  }, "\u2713 Log This Meal")))), view === "library" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6,
+      background: "#0f172a",
+      border: "1px solid #1e293b",
+      borderRadius: 12,
+      padding: 4,
+      marginBottom: 16
+    }
+  }, [["foods", "🥕 Foods", myFoods.length], ["meals", "🍽 Meals", savedMeals.length]].map(([k, label, count]) => /*#__PURE__*/React.createElement("button", {
+    key: k,
+    onClick: () => setLibraryTab(k),
+    style: {
+      flex: 1,
+      background: libraryTab === k ? "linear-gradient(135deg,#f97316,#ec4899)" : "transparent",
+      color: libraryTab === k ? "#fff" : "#94a3b8",
+      border: "none",
+      borderRadius: 9,
+      padding: "9px 12px",
+      cursor: "pointer",
+      fontFamily: "inherit",
+      fontWeight: 700,
+      fontSize: 13,
+      letterSpacing: "-0.01em",
+      transition: "all 0.15s"
+    }
+  }, label, " ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      opacity: 0.6,
+      fontSize: 11,
+      fontWeight: 600
+    }
+  }, "(", count, ")"))), ), libraryTab === "foods" && /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexDirection: "column",
@@ -3374,8 +3683,14 @@ function NutritionTracker() {
         const ex = fs.find(f => f.id === editFood.id);
         return ex ? fs.map(f => f.id === editFood.id ? editFood : f) : [editFood, ...fs];
       });
+      const justSaved = editFood;
       setEditFood(null);
       showToast("Food saved ✓");
+      // Fire-and-forget Airtable upsert by Local ID — no duplicates, edits update in place.
+      if (isConfigured) {
+        pushFoodsToAirtable(config, [justSaved])
+          .catch(e => showToast("Foods sync: " + e.message, "error"));
+      }
     },
     style: {
       flex: 1,
@@ -3456,6 +3771,10 @@ function NutritionTracker() {
     onClick: () => {
       setMyFoods(fs => fs.filter(f => f.id !== food.id));
       showToast("Removed");
+      if (isConfigured) {
+        deleteFromAirtableByLocalId(config, foodsTableNameOf(config), food.id)
+          .catch(e => showToast("Foods sync: " + e.message, "error"));
+      }
     },
     style: {
       background: "#1e293b",
@@ -3468,7 +3787,7 @@ function NutritionTracker() {
       fontWeight: 700,
       fontSize: 13
     }
-  }, "\u2715")))))), view === "meals" && /*#__PURE__*/React.createElement("div", {
+  }, "\u2715")))))), libraryTab === "meals" && /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexDirection: "column",
@@ -3707,8 +4026,13 @@ function NutritionTracker() {
         const ex = ms.find(m => m.id === editMeal.id);
         return ex ? ms.map(m => m.id === editMeal.id ? editMeal : m) : [editMeal, ...ms];
       });
+      const justSaved = editMeal;
       setEditMeal(null);
       showToast("Template saved ✓");
+      if (isConfigured) {
+        pushMealsToAirtable(config, [justSaved])
+          .catch(e => showToast("Meals sync: " + e.message, "error"));
+      }
     },
     style: {
       flex: 1,
@@ -3764,6 +4088,10 @@ function NutritionTracker() {
     onClick: () => {
       setSavedMeals(ms => ms.filter(m => m.id !== meal.id));
       showToast("Deleted");
+      if (isConfigured) {
+        deleteFromAirtableByLocalId(config, mealsTableNameOf(config), meal.id)
+          .catch(e => showToast("Meals sync: " + e.message, "error"));
+      }
     },
     style: {
       background: "none",
@@ -3773,7 +4101,7 @@ function NutritionTracker() {
       fontSize: 12,
       fontFamily: "inherit"
     }
-  }, "Delete")))))), view === "dashboard" && /*#__PURE__*/React.createElement("div", {
+  }, "Delete"))))))), view === "dashboard" && /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexDirection: "column",
@@ -3840,7 +4168,141 @@ function NutritionTracker() {
         fontFamily: "inherit",
         opacity: syncing ? 0.6 : 1
       }
-    }, syncing ? "Pushing…" : "☁️ Push All to Airtable"), /*#__PURE__*/React.createElement("div", {
+    }, syncing ? "Pushing…" : "☁️ Push All to Airtable"), isConfigured && /*#__PURE__*/React.createElement("div", {
+      style: {
+        ...S.card,
+        padding: "14px 18px"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 13,
+        fontWeight: 700,
+        marginBottom: 6
+      }
+    }, "🗂 Library Sync (Foods & Meals)"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: "#94a3b8",
+        marginBottom: 12,
+        lineHeight: 1.5
+      }
+    }, "Foods and meals auto-push when you save or delete, using ", /*#__PURE__*/React.createElement("strong", null, "Local ID"), " to upsert (no duplicates, edits update in place). Tables auto-create on first push. These buttons force a full sync as a fallback."), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "grid",
+        gridTemplateColumns: "1fr 1fr",
+        gap: 8
+      }
+    }, /*#__PURE__*/React.createElement("button", {
+      onClick: async () => {
+        setSyncing(true);
+        try {
+          const n = await pushFoodsToAirtable(config, myFoods);
+          showToast(`Pushed ${n} foods ✓`);
+        } catch (e) {
+          showToast(e.message, "error");
+        } finally {
+          setSyncing(false);
+        }
+      },
+      disabled: syncing,
+      style: {
+        background: syncing ? "#1e293b" : "linear-gradient(135deg,#f97316,#ec4899)",
+        border: "none",
+        borderRadius: 8,
+        padding: "10px",
+        color: "white",
+        fontWeight: 600,
+        fontSize: 12,
+        cursor: syncing ? "not-allowed" : "pointer",
+        fontFamily: "inherit",
+        opacity: syncing ? 0.6 : 1
+      }
+    }, `☁️ Push ${myFoods.length} Foods`), /*#__PURE__*/React.createElement("button", {
+      onClick: async () => {
+        setSyncing(true);
+        try {
+          const pulled = await pullFoodsFromAirtable(config);
+          const map = new Map(myFoods.map(f => [f.id, f]));
+          for (const f of pulled) map.set(f.id, f);
+          const merged = Array.from(map.values());
+          setMyFoods(merged);
+          lsSet("nt_foods", merged);
+          showToast(`Pulled ${pulled.length} foods ✓`);
+        } catch (e) {
+          showToast(e.message, "error");
+        } finally {
+          setSyncing(false);
+        }
+      },
+      disabled: syncing,
+      style: {
+        background: "#1e293b",
+        border: "1px solid #334155",
+        borderRadius: 8,
+        padding: "10px",
+        color: "#cbd5e1",
+        fontWeight: 600,
+        fontSize: 12,
+        cursor: syncing ? "not-allowed" : "pointer",
+        fontFamily: "inherit",
+        opacity: syncing ? 0.6 : 1
+      }
+    }, "⬇️ Pull Foods"), /*#__PURE__*/React.createElement("button", {
+      onClick: async () => {
+        setSyncing(true);
+        try {
+          const n = await pushMealsToAirtable(config, savedMeals);
+          showToast(`Pushed ${n} meals ✓`);
+        } catch (e) {
+          showToast(e.message, "error");
+        } finally {
+          setSyncing(false);
+        }
+      },
+      disabled: syncing,
+      style: {
+        background: syncing ? "#1e293b" : "linear-gradient(135deg,#f97316,#ec4899)",
+        border: "none",
+        borderRadius: 8,
+        padding: "10px",
+        color: "white",
+        fontWeight: 600,
+        fontSize: 12,
+        cursor: syncing ? "not-allowed" : "pointer",
+        fontFamily: "inherit",
+        opacity: syncing ? 0.6 : 1
+      }
+    }, `☁️ Push ${savedMeals.length} Meals`), /*#__PURE__*/React.createElement("button", {
+      onClick: async () => {
+        setSyncing(true);
+        try {
+          const pulled = await pullMealsFromAirtable(config);
+          const map = new Map(savedMeals.map(m => [m.id, m]));
+          for (const m of pulled) map.set(m.id, m);
+          const merged = Array.from(map.values());
+          setSavedMeals(merged);
+          lsSet("nt_meals", merged);
+          showToast(`Pulled ${pulled.length} meals ✓`);
+        } catch (e) {
+          showToast(e.message, "error");
+        } finally {
+          setSyncing(false);
+        }
+      },
+      disabled: syncing,
+      style: {
+        background: "#1e293b",
+        border: "1px solid #334155",
+        borderRadius: 8,
+        padding: "10px",
+        color: "#cbd5e1",
+        fontWeight: 600,
+        fontSize: 12,
+        cursor: syncing ? "not-allowed" : "pointer",
+        fontFamily: "inherit",
+        opacity: syncing ? 0.6 : 1
+      }
+    }, "⬇️ Pull Meals"))), /*#__PURE__*/React.createElement("div", {
       style: {
         ...S.card,
         padding: "14px 18px"
@@ -4357,7 +4819,20 @@ function NutritionTracker() {
       r: 5
     },
     onClick: d => d?.activePayload?.[0] && setSelectedDay(d.activePayload[0].payload.date)
-  }))), /*#__PURE__*/React.createElement("div", {
+  }), goals.calories ? /*#__PURE__*/React.createElement(ReferenceLine, {
+    y: goals.calories,
+    stroke: "#22d3ee",
+    strokeDasharray: "4 3",
+    strokeWidth: 1.5,
+    ifOverflow: "extendDomain",
+    label: {
+      value: `Goal ${goals.calories}`,
+      position: "insideTopRight",
+      fill: "#22d3ee",
+      fontSize: 10,
+      fontWeight: 700
+    }
+  }) : null)), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 11,
       color: "#334155",
@@ -4432,7 +4907,20 @@ function NutritionTracker() {
     fill: "#ec4899",
     name: "Fat (g)",
     radius: [2, 2, 0, 0]
-  })))), /*#__PURE__*/React.createElement("div", {
+  }), goals.protein ? /*#__PURE__*/React.createElement(ReferenceLine, {
+    y: goals.protein,
+    stroke: "#22d3ee",
+    strokeDasharray: "4 3",
+    strokeWidth: 1.5,
+    ifOverflow: "extendDomain",
+    label: {
+      value: `Protein goal ${goals.protein}g`,
+      position: "insideTopRight",
+      fill: "#22d3ee",
+      fontSize: 10,
+      fontWeight: 700
+    }
+  }) : null))), /*#__PURE__*/React.createElement("div", {
     style: {
       ...S.card,
       overflow: "hidden"
@@ -4563,7 +5051,7 @@ function NutritionTracker() {
       color: "#93c5fd",
       lineHeight: 1.7
     }
-  }, /*#__PURE__*/React.createElement("strong", null, "Fields to create in Airtable:"), /*#__PURE__*/React.createElement("br", null), "Local ID (text, used to dedupe on push) \xB7 Food Name (text) \xB7 Meal Type (text) \xB7 Date (date) \xB7 Time (text) \xB7 Calories (number) \xB7 Protein (g) (number) \xB7 Carbs (g) (number) \xB7 Fat (g) (number) \xB7 Fiber (g) (number) \xB7 Sugar (g) (number) \xB7 Sodium (mg) (number) \xB7 Water (ml) (number) \xB7 Notes (long text) \xB7 Confidence (text) \xB7 Serving Size (text)", /*#__PURE__*/React.createElement("br", null), /*#__PURE__*/React.createElement("br", null), "Token: ", /*#__PURE__*/React.createElement("strong", null, "airtable.com/create/tokens"), " \u2014 needs scopes: ", /*#__PURE__*/React.createElement("strong", null, "data.records:read"), ", ", /*#__PURE__*/React.createElement("strong", null, "data.records:write"), ", ", /*#__PURE__*/React.createElement("strong", null, "schema.bases:write"), " (for table creation)."), [["apiKey", "Personal Access Token", "pat…", "password"], ["baseId", "Base ID", "appXXXXXXXXXXXXXX", "text"], ["tableName", "Table Name", "Food Log", "text"]].map(([k, lbl, ph, type]) => /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("strong", null, "Fields to create in Airtable:"), /*#__PURE__*/React.createElement("br", null), "Local ID (text, used to dedupe on push) \xB7 Food Name (text) \xB7 Meal Type (text) \xB7 Date (date) \xB7 Time (text) \xB7 Calories (number) \xB7 Protein (g) (number) \xB7 Carbs (g) (number) \xB7 Fat (g) (number) \xB7 Fiber (g) (number) \xB7 Sugar (g) (number) \xB7 Sodium (mg) (number) \xB7 Water (ml) (number) \xB7 Notes (long text) \xB7 Confidence (text) \xB7 Serving Size (text)", /*#__PURE__*/React.createElement("br", null), /*#__PURE__*/React.createElement("br", null), "Token: ", /*#__PURE__*/React.createElement("strong", null, "airtable.com/create/tokens"), " \u2014 needs scopes: ", /*#__PURE__*/React.createElement("strong", null, "data.records:read"), ", ", /*#__PURE__*/React.createElement("strong", null, "data.records:write"), ", ", /*#__PURE__*/React.createElement("strong", null, "schema.bases:write"), " (for table creation)."), [["apiKey", "Personal Access Token", "pat…", "password"], ["baseId", "Base ID", "appXXXXXXXXXXXXXX", "text"], ["tableName", "Table Name", "Food Log", "text"], ["foodsTableName", "Foods Table", "Foods", "text"], ["mealsTableName", "Meals Table", "Meals", "text"]].map(([k, lbl, ph, type]) => /*#__PURE__*/React.createElement("div", {
     key: k,
     style: {
       marginBottom: 10
@@ -4709,7 +5197,36 @@ function NutritionTracker() {
       cursor: "pointer",
       fontFamily: "inherit"
     }
-  }, "\uD83E\uDDF9 Clean up local duplicates")), /*#__PURE__*/React.createElement("div", {
+  }, "\uD83E\uDDF9 Clean up local duplicates"), isConfigured && /*#__PURE__*/React.createElement("button", {
+    onClick: async () => {
+      try {
+        showToast("Scanning Airtable for duplicates…");
+        const res = await cleanupAirtableDuplicates(config, config.tableName);
+        if (res.deleted > 0) {
+          showToast(`Deleted ${res.deleted} duplicate rows from Airtable (${res.groupsWithDupes} Local IDs had dupes) ✓`);
+          // Reload entries so the local store reflects the cleanup
+          await loadEntries();
+        } else {
+          showToast(`No Airtable duplicates found (scanned ${res.scanned} rows)`);
+        }
+      } catch (e) {
+        showToast("Airtable cleanup: " + e.message, "error");
+      }
+    },
+    style: {
+      width: "100%",
+      marginTop: 8,
+      background: "#1e1a0c",
+      border: "1px solid #b45309",
+      color: "#fcd34d",
+      borderRadius: 10,
+      padding: "12px",
+      fontWeight: 700,
+      fontSize: 14,
+      cursor: "pointer",
+      fontFamily: "inherit"
+    }
+  }, "☁️🧹 Clean up Airtable duplicates")), /*#__PURE__*/React.createElement("div", {
     style: {
       ...S.card
     }
